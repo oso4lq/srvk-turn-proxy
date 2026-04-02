@@ -1,0 +1,36 @@
+# Бинарники
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+client/client
+server/server
+dist/
+
+# Go
+vendor/
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Секреты
+.env
+*.pem
+*.key
+
+# Локальные AI-правила и документация
+.ai/
+docs/
+CLAUDE.md
