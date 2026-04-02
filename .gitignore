@@ -32,5 +32,6 @@ Desktop.ini
 
 # Локальные AI-правила и документация
 .ai/
-docs/
+docs/superpowers/
+.claude/
 CLAUDE.md
