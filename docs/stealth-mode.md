@@ -78,7 +78,9 @@ stealth/
 
 **Pacer** — управляет ритмичной отправкой пакетов по таймеру с буферизацией. Генерирует dummy-пакеты в пустых слотах. Поддерживает три режима pacing.
 
-**Pipeline** — компонует Framer, Padder и Pacer в единый bidirectional relay. Обрабатывает version negotiation при подключении и legacy fallback.
+**Pipeline** — компонует Framer, Padder и Pacer в единый bidirectional relay. Обрабатывает version negotiation при подключении и legacy fallback. Экспортирует `Metrics()` для Advisor.
+
+**Advisor** (`adaptive.go`) — чистый калькулятор масштабирования каналов. Pull-модель: клиент вызывает `Tick()` каждые 5 секунд с метриками всех активных Pacer'ов, получает `ScaleAdvice` (Hold / ScaleUp / ScaleDown). Без горутин и I/O — тестируется тривиально.
 
 ## Wire-формат
 
@@ -154,6 +156,24 @@ stealth/
 
 В legacy-режиме `-n` — фиксированное число каналов (поведение не изменилось).
 
+### Архитектура Adaptive Channels
+
+```
+stealth/adaptive.go              client/main.go
+─────────────────                ─────────────
+Advisor:                         channelManager:
+  знает: утилизация буфера    →    знает: как создать канал
+  знает: пороги 70%/20%            знает: как удалить канал
+  знает: время стабилизации         не знает: откуда advice
+  решает: scale up/down/hold        реагирует: на advice
+```
+
+- **Pacer.Metrics()** — экспортирует `{BufLen, BufCap}` (заполнение/ёмкость outCh). Потокобезопасен без мьютекса (`len()`/`cap()` на каналах безопасны). В mixed mode суммирует audioCh + videoCh
+- **Pipeline.Metrics()** — проксирует вызов к внутреннему Pacer
+- **Advisor.Tick([]PacerMetrics)** — агрегирует утилизацию всех каналов, пропускает `BufCap==0` (канал ещё не запущен). Решение принимается после `StableCount` (3) тиков подряд выше/ниже порога
+- **channelManager** — управляет набором `activeChannel` (cancel + pipeline + done). `add()` неблокирующий — handshake в отдельной горутине. `removeLast()` — LIFO, отменяет последний (самый свежий) канал
+- **adaptiveLoop** — горутина, тикает каждые 5с: cleanup завершённых → hard floor до min → Tick → scale up/down
+
 ## DTLS Fingerprint Guard
 
 CI-тесты фиксируют эталонную DTLS-конфигурацию сервера и клиента:
@@ -180,10 +200,27 @@ CI-тесты фиксируют эталонную DTLS-конфигураци�
 - При `-stealth`: первый пакет читается для определения stealth/legacy клиента
 - Stealth-клиент → `Pipeline.RunWithFirstPacket()` с pacing
 - Legacy-клиент → прямой relay как раньше
+- DTLS-конфигурация извлечена в `serverDTLSConfig()` — фиксируется fingerprint-тестом
 
 ### `client/main.go`
 
-- Добавлены те же CLI-флаги
-- Добавлен `packetConnAdapter` — адаптер `net.PacketConn` → `net.Conn` для совместимости с Pipeline
-- При `-stealth`: в `oneDtlsConnection` вместо прямого relay запускается `Pipeline.RunAsClient()`
-- Первый пакет от клиента автоматически обогащается version info
+- Добавлены CLI-флаги `-stealth`, `-stealth-pacing`, `-stealth-buf`, `-stealth-min`
+- DTLS-конфигурация извлечена в `clientDTLSConfig()` — фиксируется fingerprint-тестом
+- `packetConnAdapter` — адаптер `net.PacketConn` → `net.Conn` для совместимости с Pipeline
+- `oneDtlsConnection` принимает внешний `*stealth.Pipeline` (для сбора метрик из channelManager)
+- При `-stealth`: три пути выполнения:
+  - **direct** (`-no-dtls`): только TURN, без DTLS
+  - **stealth**: `channelManager` + `adaptiveLoop` — динамические каналы
+  - **legacy**: фиксированные каналы через `oneDtlsConnectionLoop` / `oneTurnConnectionLoop`
+- TURN context исправлен: `context.Background()` → канал-специфичный `ctx` для корректной остановки при ScaleDown
+
+### Edge cases
+
+| Ситуация | Поведение |
+|----------|-----------|
+| Pacer.Metrics() до run() | Возвращает `{0, 0}`, Advisor пропускает BufCap==0 → Hold |
+| Канал умирает (DTLS/TURN ошибка) | cleanup() на следующем тике удаляет, hard floor восстанавливает до min |
+| ScaleDown с данными в буфере | cancel() → Pacer drain writeCh → UDP потери допустимы |
+| Все каналы на максимуме | ScaleUp игнорируется, back-pressure через outCh → WireGuard дропает |
+| Handshake при ScaleUp (~1-5с) | add() неблокирующий, стартующий канал: Metrics = {0, 0} → пропускается |
+| `-stealth-min` > `-n` | min принудительно уменьшается до max |
