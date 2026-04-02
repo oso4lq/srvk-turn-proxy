@@ -149,6 +149,54 @@ func TestPipelineLegacyFallback(t *testing.T) {
 	serverWG_side.Close()
 }
 
+func TestPipelineMetrics_NilPacer(t *testing.T) {
+	cfg := Config{
+		Enabled:    true,
+		PacingMode: PacingVideo,
+		BufSize:    64,
+		Version:    1,
+	}
+	pipe := NewPipeline(cfg)
+	m := pipe.Metrics()
+	if m.BufLen != 0 || m.BufCap != 0 {
+		t.Fatalf("nil pacer: got {%d, %d}, want {0, 0}", m.BufLen, m.BufCap)
+	}
+}
+
+func TestPipelineMetrics_DelegatesToPacer(t *testing.T) {
+	cfg := Config{
+		Enabled:    true,
+		PacingMode: PacingVideo,
+		BufSize:    16,
+		Version:    1,
+	}
+
+	clientDTLS, dtlsSide := net.Pipe()
+	clientWG_side, clientWG_pipe := net.Pipe()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pipe := NewPipeline(cfg)
+	go func() { _ = pipe.RunAsClient(ctx, clientDTLS, clientWG_pipe) }()
+
+	// Даём время стартовать
+	time.Sleep(50 * time.Millisecond)
+
+	m := pipe.Metrics()
+	if m.BufCap == 0 {
+		t.Fatal("Pipeline.Metrics().BufCap == 0 after RunAsClient started")
+	}
+	// BufCap должен быть 16 (bufSize из Config)
+	if m.BufCap != 16 {
+		t.Fatalf("Pipeline.Metrics().BufCap: got %d, want 16", m.BufCap)
+	}
+
+	cancel()
+	clientWG_side.Close()
+	dtlsSide.Close()
+}
+
 func TestPipelineDummyDoesNotLeak(t *testing.T) {
 	cfg := Config{
 		Enabled:    true,

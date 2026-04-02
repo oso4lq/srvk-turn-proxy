@@ -65,6 +65,7 @@ type Pipeline struct {
 	framer *Framer
 	padder *Padder
 	cfg    Config
+	pacer  *Pacer // инициализируется в runStealth()/RunAsClient()
 }
 
 // NewPipeline создаёт Pipeline с заданной конфигурацией.
@@ -74,6 +75,14 @@ func NewPipeline(cfg Config) *Pipeline {
 		padder: NewPadder(DefaultPadderConfig()),
 		cfg:    cfg,
 	}
+}
+
+// Metrics возвращает метрики Pacer. До запуска Pipeline возвращает {0, 0}.
+func (p *Pipeline) Metrics() PacerMetrics {
+	if p.pacer == nil {
+		return PacerMetrics{}
+	}
+	return p.pacer.Metrics()
 }
 
 // Run запускает stealth relay между dtlsConn и wgConn.
@@ -159,12 +168,12 @@ func (p *Pipeline) runStealth(ctx context.Context, dtlsConn net.Conn, wgConn net
 	}
 	// Dummy/keepalive первый пакет — отбрасываем
 
-	pacer := NewPacer(PacerConfig{
+	p.pacer = NewPacer(PacerConfig{
 		Mode:    p.cfg.PacingMode,
 		BufSize: p.cfg.BufSize,
 	}, p.framer, p.padder)
 
-	return pacer.run(ctx, wgConn, dtlsConn, nil)
+	return p.pacer.run(ctx, wgConn, dtlsConn, nil)
 }
 
 // RunAsClient запускает stealth relay на стороне клиента.
@@ -173,7 +182,7 @@ func (p *Pipeline) RunAsClient(ctx context.Context, dtlsConn net.Conn, wgConn ne
 	log.Printf("stealth: mode=%t pacing=%s buf=%d version=%d",
 		p.cfg.Enabled, p.cfg.PacingMode, p.cfg.BufSize, p.cfg.Version)
 
-	pacer := NewPacer(PacerConfig{
+	p.pacer = NewPacer(PacerConfig{
 		Mode:    p.cfg.PacingMode,
 		BufSize: p.cfg.BufSize,
 	}, p.framer, p.padder)
@@ -189,7 +198,7 @@ func (p *Pipeline) RunAsClient(ctx context.Context, dtlsConn net.Conn, wgConn ne
 		first: true,
 	}
 
-	return pacer.run(ctx, wrappedWG, dtlsConn, nil)
+	return p.pacer.run(ctx, wrappedWG, dtlsConn, nil)
 }
 
 // versionPrependConn оборачивает net.Conn и добавляет version info к первому Read.
