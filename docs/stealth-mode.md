@@ -172,6 +172,7 @@ Advisor:                         channelManager:
 - **Pipeline.Metrics()** — проксирует вызов к внутреннему Pacer
 - **Advisor.Tick([]PacerMetrics)** — агрегирует утилизацию всех каналов, пропускает `BufCap==0` (канал ещё не запущен). Решение принимается после `StableCount` (3) тиков подряд выше/ниже порога
 - **channelManager** — управляет набором `activeChannel` (cancel + pipeline + done). `add()` неблокирующий — handshake в отдельной горутине. `removeLast()` — LIFO, отменяет последний (самый свежий) канал
+- **adaptiveLoop** — каждые ~30с логирует статус: число каналов, утилизация буфера (%), приблизительная макс. пропускная способность (Мбит/с). Оценка скорости — по формуле `каналы × pps × maxPayload`, без byte counters
 - **adaptiveLoop** — горутина, тикает каждые 5с: cleanup завершённых → hard floor до min → Tick → scale up/down
 
 ## DTLS Fingerprint Guard

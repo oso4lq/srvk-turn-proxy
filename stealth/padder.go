@@ -2,7 +2,7 @@ package stealth
 
 import (
 	"crypto/rand"
-	"encoding/binary"
+	"math/big"
 )
 
 // SizeProfile — диапазон целевых размеров пакета.
@@ -107,11 +107,14 @@ func (p *Padder) TargetSize(payloadLen int) int {
 }
 
 // cryptoRandIntn возвращает криптографически случайное число в [0, n).
+// Использует crypto/rand.Int — без modulo bias при любых n.
 func cryptoRandIntn(n int) int {
 	if n <= 0 {
 		return 0
 	}
-	var buf [2]byte
-	_, _ = rand.Read(buf[:])
-	return int(binary.BigEndian.Uint16(buf[:])) % n
+	v, err := rand.Int(rand.Reader, big.NewInt(int64(n)))
+	if err != nil {
+		return 0
+	}
+	return int(v.Int64())
 }

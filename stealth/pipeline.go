@@ -44,9 +44,9 @@ func ResolveConfig(stealthFlag *bool, pacingFlag *string, bufFlag *int) Config {
 	}
 
 	if pacingFlag != nil && *pacingFlag != "" {
-		cfg.PacingMode = PacingMode(*pacingFlag)
+		cfg.PacingMode = parsePacingMode(*pacingFlag)
 	} else if env := os.Getenv("STEALTH_PACING_MODE"); env != "" {
-		cfg.PacingMode = PacingMode(env)
+		cfg.PacingMode = parsePacingMode(env)
 	}
 
 	if bufFlag != nil && *bufFlag > 0 {
@@ -58,6 +58,18 @@ func ResolveConfig(stealthFlag *bool, pacingFlag *string, bufFlag *int) Config {
 	}
 
 	return cfg
+}
+
+// parsePacingMode валидирует строку pacing mode. При невалидном значении
+// логирует предупреждение и возвращает PacingVideo.
+func parsePacingMode(s string) PacingMode {
+	switch PacingMode(s) {
+	case PacingAudio, PacingVideo, PacingMixed:
+		return PacingMode(s)
+	default:
+		log.Printf("stealth: неизвестный pacing mode %q, используется %q", s, PacingVideo)
+		return PacingVideo
+	}
 }
 
 // Pipeline компонует Framer, Padder и Pacer в единый relay.

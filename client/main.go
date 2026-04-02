@@ -916,8 +916,12 @@ func (cm *channelManager) cleanup() {
 // collectMetrics() собирать реальные метрики утилизации буфера.
 func (cm *channelManager) add() {
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
+	cm.addLocked()
+	cm.mu.Unlock()
+}
 
+// addLocked — внутренняя реализация add(). Вызывающий должен удерживать cm.mu.
+func (cm *channelManager) addLocked() {
 	chCtx, chCancel := context.WithCancel(cm.parentCtx)
 	pipe := stealth.NewPipeline(cm.stealthCfg)
 	done := make(chan struct{})
@@ -964,32 +968,82 @@ func (cm *channelManager) add() {
 	}()
 }
 
-// removeLast отменяет последний (самый свежий) канал — LIFO.
-// Горутина канала завершится при отмене контекста; cleanup() уберёт её из списка.
-func (cm *channelManager) removeLast() {
+// addIfBelow запускает новый канал, если текущее число < limit.
+// Возвращает true, если канал был добавлен. Check+act под одним lock.
+func (cm *channelManager) addIfBelow(limit int) bool {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	if len(cm.channels) == 0 {
-		return
+	if len(cm.channels) >= limit {
+		return false
 	}
-	last := cm.channels[len(cm.channels)-1]
+	cm.addLocked()
+	return true
+}
+
+// removeLastIfAbove отменяет последний канал, если текущее число > floor.
+// Возвращает true, если канал был удалён. Check+act под одним lock.
+func (cm *channelManager) removeLastIfAbove(floor int) bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if len(cm.channels) <= floor {
+		return false
+	}
+	idx := len(cm.channels) - 1
+	last := cm.channels[idx]
 	last.cancel()
-	cm.channels = cm.channels[:len(cm.channels)-1]
+	cm.channels[idx] = activeChannel{} // обнуляем ссылку, чтобы не задерживать GC
+	cm.channels = cm.channels[:idx]
+	return true
+}
+
+// aggregateUtilization считает среднюю утилизацию буфера по всем каналам.
+func aggregateUtilization(metrics []stealth.PacerMetrics) float64 {
+	var totalLen, totalCap int
+	for _, m := range metrics {
+		if m.BufCap == 0 {
+			continue
+		}
+		totalLen += m.BufLen
+		totalCap += m.BufCap
+	}
+	if totalCap == 0 {
+		return 0
+	}
+	return float64(totalLen) / float64(totalCap)
+}
+
+// estimateMbps возвращает приблизительную макс. пропускную способность в Мбит/с.
+// Формула: каналы × пакетов/с × макс. полезная нагрузка × 8 / 1_000_000.
+func estimateMbps(channels int, mode stealth.PacingMode) float64 {
+	const maxPayload = 1200.0 // практический максимум WG-пакета через DTLS+TURN
+	var pps float64
+	switch mode {
+	case stealth.PacingAudio:
+		pps = 50.0 // 1/20ms
+	case stealth.PacingVideo:
+		pps = 30.3 // 1/33ms
+	case stealth.PacingMixed:
+		pps = 80.3 // audio 50 + video 30.3
+	default:
+		pps = 30.3
+	}
+	return float64(channels) * pps * maxPayload * 8 / 1_000_000
 }
 
 // adaptiveLoop запускается как горутина. Каждые 5с: cleanup, hard floor, Tick.
+// Каждые ~30с (6 тиков) логирует статус: каналы, утилизация, оценка скорости.
 func adaptiveLoop(ctx context.Context, advisor *stealth.Advisor, cm *channelManager, min, max int) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+	var tickN int
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			cm.cleanup()
-			// Hard floor: восстанавливаем до min
-			for cm.count() < min {
-				cm.add()
+			// Hard floor: восстанавливаем до min (addIfBelow — атомарный check+act)
+			for cm.addIfBelow(min) {
 				log.Printf("stealth adaptive: restore → %d каналов", cm.count())
 			}
 			// Adaptive scaling
@@ -997,15 +1051,21 @@ func adaptiveLoop(ctx context.Context, advisor *stealth.Advisor, cm *channelMana
 			advice := advisor.Tick(metrics)
 			switch advice {
 			case stealth.ScaleUp:
-				if cm.count() < max {
-					cm.add()
+				if cm.addIfBelow(max) {
 					log.Printf("stealth adaptive: scale-up → %d каналов", cm.count())
 				}
 			case stealth.ScaleDown:
-				if cm.count() > min {
-					cm.removeLast()
+				if cm.removeLastIfAbove(min) {
 					log.Printf("stealth adaptive: scale-down → %d каналов", cm.count())
 				}
+			}
+			// Периодический статус (~30с)
+			tickN++
+			if tickN%6 == 0 {
+				ch := cm.count()
+				util := aggregateUtilization(metrics)
+				mbps := estimateMbps(ch, cm.stealthCfg.PacingMode)
+				log.Printf("stealth: %d каналов, утилизация %.0f%%, ~%.1f Мбит/с (est)", ch, util*100, mbps)
 			}
 		}
 	}
