@@ -426,17 +426,26 @@ func getYandexCreds(link string) (string, string, string, error) {
 	}
 }
 
-func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.Conn, error) {
+// clientDTLSConfig возвращает DTLS-конфигурацию клиента.
+// Изменения здесь ломают TestClientDTLSFingerprint — это намеренно.
+func clientDTLSConfig() (*dtls.Config, error) {
 	certificate, err := selfsign.GenerateSelfSigned()
 	if err != nil {
 		return nil, err
 	}
-	config := &dtls.Config{
+	return &dtls.Config{
 		Certificates:          []tls.Certificate{certificate},
 		InsecureSkipVerify:    true,
 		ExtendedMasterSecret:  dtls.RequireExtendedMasterSecret,
 		CipherSuites:          []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
 		ConnectionIDGenerator: dtls.OnlySendCIDGenerator(),
+	}, nil
+}
+
+func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.Conn, error) {
+	config, err := clientDTLSConfig()
+	if err != nil {
+		return nil, err
 	}
 	ctx1, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
