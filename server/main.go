@@ -18,6 +18,21 @@ import (
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 )
 
+// serverDTLSConfig возвращает DTLS-конфигурацию сервера.
+// Изменения здесь ломают TestServerDTLSFingerprint — это намеренно.
+func serverDTLSConfig() *dtls.Config {
+	certificate, err := selfsign.GenerateSelfSigned()
+	if err != nil {
+		panic(err)
+	}
+	return &dtls.Config{
+		Certificates:          []tls.Certificate{certificate},
+		ExtendedMasterSecret:  dtls.RequireExtendedMasterSecret,
+		CipherSuites:          []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+		ConnectionIDGenerator: dtls.RandomCIDGenerator(8),
+	}
+}
+
 func main() {
 	listen := flag.String("listen", "0.0.0.0:56000", "listen on ip:port")
 	connect := flag.String("connect", "", "connect to ip:port")
@@ -47,23 +62,7 @@ func main() {
 	if len(*connect) == 0 {
 		log.Panicf("server address is required")
 	}
-	// Generate a certificate and private key to secure the connection
-	certificate, genErr := selfsign.GenerateSelfSigned()
-	if genErr != nil {
-		panic(err)
-	}
-
-	//
-	// Everything below is the pion-DTLS API! Thanks for using it ❤️.
-	//
-
-	// Prepare the configuration of the DTLS connection
-	config := &dtls.Config{
-		Certificates:          []tls.Certificate{certificate},
-		ExtendedMasterSecret:  dtls.RequireExtendedMasterSecret,
-		CipherSuites:          []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
-		ConnectionIDGenerator: dtls.RandomCIDGenerator(8),
-	}
+	config := serverDTLSConfig()
 
 	// Connect to a DTLS server
 	listener, err := dtls.Listen("udp", addr, config)
