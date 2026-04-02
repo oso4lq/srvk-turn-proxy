@@ -460,7 +460,7 @@ func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.
 	return dtlsConn, nil
 }
 
-func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}, stealthCfg stealth.Config, c chan<- error) {
+func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}, stealthCfg stealth.Config, pipe *stealth.Pipeline, c chan<- error) {
 	var err error = nil
 	defer func() { c <- err }()
 	dtlsctx, dtlscancel := context.WithCancel(ctx)
@@ -502,7 +502,11 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
 	if stealthCfg.Enabled {
 		var addr atomic.Value
 		wgAdapter := &packetConnAdapter{conn: listenConn, addr: &addr}
-		pipe := stealth.NewPipeline(stealthCfg)
+		// Если Pipeline передан извне (adaptive mode) — используем его.
+		// Иначе создаём новый (legacy stealth без adaptive).
+		if pipe == nil {
+			pipe = stealth.NewPipeline(stealthCfg)
+		}
 		if err1 := pipe.RunAsClient(dtlsctx, dtlsConn, wgAdapter); err1 != nil {
 			log.Printf("Stealth pipeline error: %s", err1)
 		}
@@ -714,7 +718,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 
 	wg := sync.WaitGroup{}
 	wg.Add(2)
-	turnctx, turncancel := context.WithCancel(context.Background())
+	turnctx, turncancel := context.WithCancel(ctx)
 	context.AfterFunc(turnctx, func() {
 		if err := relayConn.SetDeadline(time.Now()); err != nil {
 			log.Printf("Failed to set relay deadline: %s", err)
@@ -797,7 +801,7 @@ func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnCha
 			return
 		case listenConn := <-listenConnChan:
 			c := make(chan error)
-			go oneDtlsConnection(ctx, peer, listenConn, connchan, okchan, stealthCfg, c)
+			go oneDtlsConnection(ctx, peer, listenConn, connchan, okchan, stealthCfg, nil, c)
 			if err := <-c; err != nil {
 				log.Printf("%s", err)
 			}
@@ -855,6 +859,158 @@ func (a *packetConnAdapter) SetDeadline(t time.Time) error      { return a.conn.
 func (a *packetConnAdapter) SetReadDeadline(t time.Time) error  { return a.conn.SetReadDeadline(t) }
 func (a *packetConnAdapter) SetWriteDeadline(t time.Time) error { return a.conn.SetWriteDeadline(t) }
 
+// activeChannel — один DTLS+TURN канал с независимым lifecycle.
+type activeChannel struct {
+	cancel   context.CancelFunc
+	pipeline *stealth.Pipeline
+	done     <-chan struct{} // закрывается при завершении горутины канала
+}
+
+// channelManager управляет динамическим набором каналов в stealth-mode.
+type channelManager struct {
+	mu         sync.Mutex
+	channels   []activeChannel
+	peer       *net.UDPAddr
+	stealthCfg stealth.Config
+	params     *turnParams
+	listenConn net.PacketConn
+	parentCtx  context.Context
+}
+
+// count возвращает число активных каналов.
+func (cm *channelManager) count() int {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return len(cm.channels)
+}
+
+// collectMetrics собирает PacerMetrics со всех активных Pipeline.
+func (cm *channelManager) collectMetrics() []stealth.PacerMetrics {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	metrics := make([]stealth.PacerMetrics, len(cm.channels))
+	for i, ch := range cm.channels {
+		metrics[i] = ch.pipeline.Metrics()
+	}
+	return metrics
+}
+
+// cleanup удаляет завершённые каналы (done закрыт).
+func (cm *channelManager) cleanup() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	alive := cm.channels[:0]
+	for _, ch := range cm.channels {
+		select {
+		case <-ch.done:
+			// горутина завершилась — пропускаем
+		default:
+			alive = append(alive, ch)
+		}
+	}
+	cm.channels = alive
+}
+
+// add запускает новый канал асинхронно. Возвращается немедленно.
+// Pipeline создаётся здесь и передаётся в oneDtlsConnection — это позволяет
+// collectMetrics() собирать реальные метрики утилизации буфера.
+func (cm *channelManager) add() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	chCtx, chCancel := context.WithCancel(cm.parentCtx)
+	pipe := stealth.NewPipeline(cm.stealthCfg)
+	done := make(chan struct{})
+
+	cm.channels = append(cm.channels, activeChannel{
+		cancel:   chCancel,
+		pipeline: pipe,
+		done:     done,
+	})
+
+	go func() {
+		defer close(done)
+		defer chCancel()
+
+		// DTLS connection — передаём pipe для сбора метрик
+		connchan := make(chan net.PacketConn, 1)
+		okchan := make(chan struct{}, 1)
+		c := make(chan error, 1)
+		go oneDtlsConnection(chCtx, cm.peer, cm.listenConn, connchan, okchan, cm.stealthCfg, pipe, c)
+
+		// TURN connection
+		select {
+		case <-chCtx.Done():
+			return
+		case conn2 := <-connchan:
+			tc := make(chan error, 1)
+			go oneTurnConnection(chCtx, cm.params, cm.peer, conn2, tc)
+			select {
+			case <-chCtx.Done():
+			case err := <-tc:
+				if err != nil {
+					log.Printf("stealth adaptive: TURN ошибка: %s", err)
+				}
+			case err := <-c:
+				if err != nil {
+					log.Printf("stealth adaptive: DTLS ошибка: %s", err)
+				}
+			}
+		case err := <-c:
+			if err != nil {
+				log.Printf("stealth adaptive: DTLS ошибка: %s", err)
+			}
+		}
+	}()
+}
+
+// removeLast отменяет последний (самый свежий) канал — LIFO.
+// Горутина канала завершится при отмене контекста; cleanup() уберёт её из списка.
+func (cm *channelManager) removeLast() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if len(cm.channels) == 0 {
+		return
+	}
+	last := cm.channels[len(cm.channels)-1]
+	last.cancel()
+	cm.channels = cm.channels[:len(cm.channels)-1]
+}
+
+// adaptiveLoop запускается как горутина. Каждые 5с: cleanup, hard floor, Tick.
+func adaptiveLoop(ctx context.Context, advisor *stealth.Advisor, cm *channelManager, min, max int) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cm.cleanup()
+			// Hard floor: восстанавливаем до min
+			for cm.count() < min {
+				cm.add()
+				log.Printf("stealth adaptive: restore → %d каналов", cm.count())
+			}
+			// Adaptive scaling
+			metrics := cm.collectMetrics()
+			advice := advisor.Tick(metrics)
+			switch advice {
+			case stealth.ScaleUp:
+				if cm.count() < max {
+					cm.add()
+					log.Printf("stealth adaptive: scale-up → %d каналов", cm.count())
+				}
+			case stealth.ScaleDown:
+				if cm.count() > min {
+					cm.removeLast()
+					log.Printf("stealth adaptive: scale-down → %d каналов", cm.count())
+				}
+			}
+		}
+	}
+}
+
 func main() { //nolint:cyclop
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -883,6 +1039,7 @@ func main() { //nolint:cyclop
 	stealthFlag := flag.Bool("stealth", false, "включить stealth-слой")
 	stealthPacing := flag.String("stealth-pacing", "", "режим pacing: audio, video, mixed (default video)")
 	stealthBuf := flag.Int("stealth-buf", 0, "размер буфера stealth (default 64)")
+	stealthMin := flag.Int("stealth-min", 2, "минимум каналов в stealth mode")
 	flag.Parse()
 
 	stealthCfg := stealth.ResolveConfig(stealthFlag, stealthPacing, stealthBuf)
@@ -962,7 +1119,31 @@ func main() { //nolint:cyclop
 				oneTurnConnectionLoop(ctx, params, peer, listenConnChan, t)
 			})
 		}
+	} else if stealthCfg.Enabled {
+		// Adaptive stealth: channelManager + adaptiveLoop
+		cm := &channelManager{
+			peer:       peer,
+			stealthCfg: stealthCfg,
+			params:     params,
+			listenConn: listenConn,
+			parentCtx:  ctx,
+		}
+		minCh := *stealthMin
+		maxCh := *n
+		if minCh > maxCh {
+			minCh = maxCh
+		}
+		// Стартовые каналы
+		for i := 0; i < minCh; i++ {
+			cm.add()
+		}
+		log.Printf("stealth adaptive: запуск с %d каналами (min=%d, max=%d)", minCh, minCh, maxCh)
+		advisor := stealth.NewAdvisor(stealth.DefaultAdvisorConfig())
+		wg1.Go(func() {
+			adaptiveLoop(ctx, advisor, cm, minCh, maxCh)
+		})
 	} else {
+		// Legacy: фиксированные каналы
 		okchan := make(chan struct{})
 		connchan := make(chan net.PacketConn)
 
