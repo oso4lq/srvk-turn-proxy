@@ -29,6 +29,11 @@ type Pacer struct {
 	framer  *Framer
 	padder  *Padder
 	bufSize int
+	// Каналы буфера — промоутены из локальных переменных для экспорта метрик.
+	// Инициализируются в run()/runMixed(). До этого — nil.
+	outCh   chan []byte // non-mixed mode
+	audioCh chan []byte // mixed mode
+	videoCh chan []byte // mixed mode
 }
 
 // NewPacer создаёт Pacer.
@@ -42,6 +47,27 @@ func NewPacer(cfg PacerConfig, framer *Framer, padder *Padder) *Pacer {
 		framer:  framer,
 		padder:  padder,
 		bufSize: bufSize,
+	}
+}
+
+// Metrics возвращает приблизительный snapshot утилизации буфера.
+// До запуска run() возвращает {0, 0}. Потокобезопасен без мьютекса.
+func (p *Pacer) Metrics() PacerMetrics {
+	if p.mode == PacingMixed {
+		if p.audioCh == nil || p.videoCh == nil {
+			return PacerMetrics{}
+		}
+		return PacerMetrics{
+			BufLen: len(p.audioCh) + len(p.videoCh),
+			BufCap: cap(p.audioCh) + cap(p.videoCh),
+		}
+	}
+	if p.outCh == nil {
+		return PacerMetrics{}
+	}
+	return PacerMetrics{
+		BufLen: len(p.outCh),
+		BufCap: cap(p.outCh),
 	}
 }
 
@@ -96,7 +122,7 @@ func (p *Pacer) run(ctx context.Context, src net.Conn, dst net.Conn, firstInboun
 	}
 
 	interval := intervalForMode(p.mode)
-	outCh := make(chan []byte, p.bufSize)
+	p.outCh = make(chan []byte, p.bufSize)
 	// Единый output channel для записи в dst
 	writeCh := make(chan []byte, p.bufSize)
 
@@ -124,14 +150,14 @@ func (p *Pacer) run(ctx context.Context, src net.Conn, dst net.Conn, firstInboun
 			pkt := make([]byte, n)
 			copy(pkt, buf[:n])
 			select {
-			case outCh <- pkt:
+			case p.outCh <- pkt:
 			case <-ctx2.Done():
 				return
 			}
 		}
 	}()
 
-	// pacingLoop: outCh -> encode -> writeCh
+	// pacingLoop: p.outCh -> encode -> writeCh
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -147,7 +173,7 @@ func (p *Pacer) run(ctx context.Context, src net.Conn, dst net.Conn, firstInboun
 			}
 
 			select {
-			case data := <-outCh:
+			case data := <-p.outCh:
 				// Data пакет
 				targetSize := p.padder.TargetSize(len(data))
 				frame := p.framer.Encode(FlagData, data, targetSize)
@@ -270,8 +296,8 @@ func (p *Pacer) processInbound(frame []byte, src net.Conn) error {
 
 // runMixed — pacing с двумя таймерами (audio + video) и единым output channel.
 func (p *Pacer) runMixed(ctx context.Context, cancel context.CancelFunc, src net.Conn, dst net.Conn, firstInboundPacket []byte, wg *sync.WaitGroup, errCh chan error) error {
-	audioCh := make(chan []byte, p.bufSize)
-	videoCh := make(chan []byte, p.bufSize)
+	p.audioCh = make(chan []byte, p.bufSize)
+	p.videoCh = make(chan []byte, p.bufSize)
 	writeCh := make(chan []byte, p.bufSize*2)
 
 	// readLoop: src -> audio/videoCh по размеру пакета
@@ -299,13 +325,13 @@ func (p *Pacer) runMixed(ctx context.Context, cancel context.CancelFunc, src net
 			copy(pkt, buf[:n])
 			if n <= 200 {
 				select {
-				case audioCh <- pkt:
+				case p.audioCh <- pkt:
 				case <-ctx.Done():
 					return
 				}
 			} else {
 				select {
-				case videoCh <- pkt:
+				case p.videoCh <- pkt:
 				case <-ctx.Done():
 					return
 				}
@@ -318,7 +344,7 @@ func (p *Pacer) runMixed(ctx context.Context, cancel context.CancelFunc, src net
 	go func() {
 		defer wg.Done()
 		defer cancel()
-		p.pacingLoop(ctx, audioCh, writeCh, audioInterval)
+		p.pacingLoop(ctx, p.audioCh, writeCh, audioInterval)
 	}()
 
 	// videoPacingLoop
@@ -326,7 +352,7 @@ func (p *Pacer) runMixed(ctx context.Context, cancel context.CancelFunc, src net
 	go func() {
 		defer wg.Done()
 		defer cancel()
-		p.pacingLoop(ctx, videoCh, writeCh, videoInterval)
+		p.pacingLoop(ctx, p.videoCh, writeCh, videoInterval)
 	}()
 
 	// writerLoop (с drain при shutdown)

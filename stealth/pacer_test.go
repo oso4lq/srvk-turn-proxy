@@ -157,6 +157,67 @@ func TestPacerGracefulShutdown(t *testing.T) {
 	dtlsSide.Close()
 }
 
+func TestPacerMetrics_BeforeRun(t *testing.T) {
+	pacer := helperPacer(64)
+	m := pacer.Metrics()
+	if m.BufLen != 0 || m.BufCap != 0 {
+		t.Fatalf("before run: got {%d, %d}, want {0, 0}", m.BufLen, m.BufCap)
+	}
+}
+
+func TestPacerMetrics_Running(t *testing.T) {
+	pacer := helperPacer(8) // маленький буфер для быстрого заполнения
+	_, wgPipe := net.Pipe()
+	dtlsPipe, dtlsSide := net.Pipe()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = pacer.Run(ctx, wgPipe, dtlsPipe) }()
+
+	// Даём Pacer время стартовать и создать outCh
+	time.Sleep(50 * time.Millisecond)
+
+	// BufCap должен быть > 0 после запуска
+	m := pacer.Metrics()
+	if m.BufCap == 0 {
+		t.Fatal("BufCap == 0 after run started")
+	}
+
+	cancel()
+	wgPipe.Close()
+	dtlsSide.Close()
+}
+
+func TestPacerMetrics_MixedMode(t *testing.T) {
+	f := &Framer{}
+	p := NewPadder(DefaultPadderConfig())
+	pacer := NewPacer(PacerConfig{
+		Mode:    PacingMixed,
+		BufSize: 16,
+	}, f, p)
+
+	_, wgPipe := net.Pipe()
+	dtlsPipe, dtlsSide := net.Pipe()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = pacer.Run(ctx, wgPipe, dtlsPipe) }()
+
+	time.Sleep(50 * time.Millisecond)
+
+	m := pacer.Metrics()
+	// Mixed mode: BufCap = cap(audioCh) + cap(videoCh) = 16 + 16 = 32
+	if m.BufCap != 32 {
+		t.Fatalf("mixed BufCap: got %d, want 32", m.BufCap)
+	}
+
+	cancel()
+	wgPipe.Close()
+	dtlsSide.Close()
+}
+
 func TestPacerMixedMode(t *testing.T) {
 	f := &Framer{}
 	p := NewPadder(DefaultPadderConfig())
