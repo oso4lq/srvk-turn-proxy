@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/bschaatsbergen/dnsdialer"
+	"github.com/cacggghp/vk-turn-proxy/stealth"
 	"github.com/cbeuw/connutil"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -450,7 +451,7 @@ func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.
 	return dtlsConn, nil
 }
 
-func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}, c chan<- error) {
+func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}, stealthCfg stealth.Config, c chan<- error) {
 	var err error = nil
 	defer func() { c <- err }()
 	dtlsctx, dtlscancel := context.WithCancel(ctx)
@@ -489,80 +490,89 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
 		}
 	}()
 
-	wg := sync.WaitGroup{}
-	wg.Add(2)
-	context.AfterFunc(dtlsctx, func() {
-		if err := listenConn.SetDeadline(time.Now()); err != nil {
-			log.Printf("Failed to set listener deadline: %s", err)
+	if stealthCfg.Enabled {
+		var addr atomic.Value
+		wgAdapter := &packetConnAdapter{conn: listenConn, addr: &addr}
+		pipe := stealth.NewPipeline(stealthCfg)
+		if err1 := pipe.RunAsClient(dtlsctx, dtlsConn, wgAdapter); err1 != nil {
+			log.Printf("Stealth pipeline error: %s", err1)
 		}
-		if err := dtlsConn.SetDeadline(time.Now()); err != nil {
-			log.Printf("Failed to set DTLS deadline: %s", err)
+	} else {
+		wg := sync.WaitGroup{}
+		wg.Add(2)
+		context.AfterFunc(dtlsctx, func() {
+			if err := listenConn.SetDeadline(time.Now()); err != nil {
+				log.Printf("Failed to set listener deadline: %s", err)
+			}
+			if err := dtlsConn.SetDeadline(time.Now()); err != nil {
+				log.Printf("Failed to set DTLS deadline: %s", err)
+			}
+		})
+		var addr atomic.Value
+		// Start read-loop on listenConn
+		go func() {
+			defer wg.Done()
+			defer dtlscancel()
+			buf := make([]byte, 1600)
+			for {
+				select {
+				case <-dtlsctx.Done():
+					return
+				default:
+				}
+				n, addr1, err1 := listenConn.ReadFrom(buf)
+				if err1 != nil {
+					log.Printf("Failed: %s", err1)
+					return
+				}
+
+				addr.Store(addr1) // store peer
+
+				_, err1 = dtlsConn.Write(buf[:n])
+				if err1 != nil {
+					log.Printf("Failed: %s", err1)
+					return
+				}
+			}
+		}()
+
+		// Start read-loop on dtlsConn
+		go func() {
+			defer wg.Done()
+			defer dtlscancel()
+			buf := make([]byte, 1600)
+			for {
+				select {
+				case <-dtlsctx.Done():
+					return
+				default:
+				}
+				n, err1 := dtlsConn.Read(buf)
+				if err1 != nil {
+					log.Printf("Failed: %s", err1)
+					return
+				}
+				addr1, ok := addr.Load().(net.Addr)
+				if !ok {
+					log.Printf("Failed: no listener ip")
+					return
+				}
+
+				_, err1 = listenConn.WriteTo(buf[:n], addr1)
+				if err1 != nil {
+					log.Printf("Failed: %s", err1)
+					return
+				}
+			}
+		}()
+
+		wg.Wait()
+		if err := listenConn.SetDeadline(time.Time{}); err != nil {
+			log.Printf("Failed to clear listener deadline: %s", err)
 		}
-	})
-	var addr atomic.Value
-	// Start read-loop on listenConn
-	go func() {
-		defer wg.Done()
-		defer dtlscancel()
-		buf := make([]byte, 1600)
-		for {
-			select {
-			case <-dtlsctx.Done():
-				return
-			default:
-			}
-			n, addr1, err1 := listenConn.ReadFrom(buf)
-			if err1 != nil {
-				log.Printf("Failed: %s", err1)
-				return
-			}
-
-			addr.Store(addr1) // store peer
-
-			_, err1 = dtlsConn.Write(buf[:n])
-			if err1 != nil {
-				log.Printf("Failed: %s", err1)
-				return
-			}
+		if err := dtlsConn.SetDeadline(time.Time{}); err != nil {
+			log.Printf("Failed to clear DTLS deadline: %s", err)
 		}
-	}()
-
-	// Start read-loop on dtlsConn
-	go func() {
-		defer wg.Done()
-		defer dtlscancel()
-		buf := make([]byte, 1600)
-		for {
-			select {
-			case <-dtlsctx.Done():
-				return
-			default:
-			}
-			n, err1 := dtlsConn.Read(buf)
-			if err1 != nil {
-				log.Printf("Failed: %s", err1)
-				return
-			}
-			addr1, ok := addr.Load().(net.Addr)
-			if !ok {
-				log.Printf("Failed: no listener ip")
-				return
-			}
-
-			_, err1 = listenConn.WriteTo(buf[:n], addr1)
-			if err1 != nil {
-				log.Printf("Failed: %s", err1)
-				return
-			}
-		}
-	}()
-
-	wg.Wait()
-	if err := listenConn.SetDeadline(time.Time{}); err != nil {
-		log.Printf("Failed to clear listener deadline: %s", err)
-	}
-	if err := dtlsConn.SetDeadline(time.Time{}); err != nil {
-		log.Printf("Failed to clear DTLS deadline: %s", err)
 	}
 }
 
@@ -771,14 +781,14 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	}
 }
 
-func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnChan <-chan net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}) {
+func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnChan <-chan net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}, stealthCfg stealth.Config) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case listenConn := <-listenConnChan:
 			c := make(chan error)
-			go oneDtlsConnection(ctx, peer, listenConn, connchan, okchan, c)
+			go oneDtlsConnection(ctx, peer, listenConn, connchan, okchan, stealthCfg, c)
 			if err := <-c; err != nil {
 				log.Printf("%s", err)
 			}
@@ -805,6 +815,37 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 	}
 }
 
+// packetConnAdapter оборачивает net.PacketConn + tracked address в net.Conn
+// для совместимости с stealth.Pipeline.
+type packetConnAdapter struct {
+	conn net.PacketConn
+	addr *atomic.Value
+}
+
+func (a *packetConnAdapter) Read(b []byte) (int, error) {
+	n, addr, err := a.conn.ReadFrom(b)
+	if err != nil {
+		return n, err
+	}
+	a.addr.Store(addr)
+	return n, nil
+}
+
+func (a *packetConnAdapter) Write(b []byte) (int, error) {
+	addr, ok := a.addr.Load().(net.Addr)
+	if !ok {
+		return 0, fmt.Errorf("no listener address")
+	}
+	return a.conn.WriteTo(b, addr)
+}
+
+func (a *packetConnAdapter) Close() error                       { return a.conn.Close() }
+func (a *packetConnAdapter) LocalAddr() net.Addr                { return a.conn.LocalAddr() }
+func (a *packetConnAdapter) RemoteAddr() net.Addr               { addr, _ := a.addr.Load().(net.Addr); return addr }
+func (a *packetConnAdapter) SetDeadline(t time.Time) error      { return a.conn.SetDeadline(t) }
+func (a *packetConnAdapter) SetReadDeadline(t time.Time) error  { return a.conn.SetReadDeadline(t) }
+func (a *packetConnAdapter) SetWriteDeadline(t time.Time) error { return a.conn.SetWriteDeadline(t) }
+
 func main() { //nolint:cyclop
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -830,7 +871,12 @@ func main() { //nolint:cyclop
 	n := flag.Int("n", 0, "connections to TURN (default 16 for VK, 1 for Yandex)")
 	udp := flag.Bool("udp", false, "connect to TURN with UDP")
 	direct := flag.Bool("no-dtls", false, "connect without obfuscation. DO NOT USE")
+	stealthFlag := flag.Bool("stealth", false, "включить stealth-слой")
+	stealthPacing := flag.String("stealth-pacing", "", "режим pacing: audio, video, mixed (default video)")
+	stealthBuf := flag.Int("stealth-buf", 0, "размер буфера stealth (default 64)")
 	flag.Parse()
+
+	stealthCfg := stealth.ResolveConfig(stealthFlag, stealthPacing, stealthBuf)
 	if *peerAddr == "" {
 		log.Panicf("Need peer address!")
 	}
@@ -912,7 +958,7 @@ func main() { //nolint:cyclop
 		connchan := make(chan net.PacketConn)
 
 		wg1.Go(func() {
-			oneDtlsConnectionLoop(ctx, peer, listenConnChan, connchan, okchan)
+			oneDtlsConnectionLoop(ctx, peer, listenConnChan, connchan, okchan, stealthCfg)
 		})
 
 		wg1.Go(func() {
@@ -926,7 +972,7 @@ func main() { //nolint:cyclop
 		for i := 0; i < *n-1; i++ {
 			connchan := make(chan net.PacketConn)
 			wg1.Go(func() {
-				oneDtlsConnectionLoop(ctx, peer, listenConnChan, connchan, nil)
+				oneDtlsConnectionLoop(ctx, peer, listenConnChan, connchan, nil, stealthCfg)
 			})
 			wg1.Go(func() {
 				oneTurnConnectionLoop(ctx, params, peer, connchan, t)

@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cacggghp/vk-turn-proxy/stealth"
 	"github.com/pion/dtls/v3"
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 )
@@ -20,7 +21,12 @@ import (
 func main() {
 	listen := flag.String("listen", "0.0.0.0:56000", "listen on ip:port")
 	connect := flag.String("connect", "", "connect to ip:port")
+	stealthFlag := flag.Bool("stealth", false, "включить stealth-слой")
+	stealthPacing := flag.String("stealth-pacing", "", "режим pacing: audio, video, mixed (default video)")
+	stealthBuf := flag.Int("stealth-buf", 0, "размер буфера stealth (default 64)")
 	flag.Parse()
+
+	stealthCfg := stealth.ResolveConfig(stealthFlag, stealthPacing, stealthBuf)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -129,80 +135,96 @@ func main() {
 				}
 			}()
 
-			var wg sync.WaitGroup
-			wg.Add(2)
-			ctx2, cancel2 := context.WithCancel(ctx)
-			context.AfterFunc(ctx2, func() {
-				if err := conn.SetDeadline(time.Now()); err != nil {
-					log.Printf("failed to set incoming deadline: %s", err)
-				}
-				if err := serverConn.SetDeadline(time.Now()); err != nil {
-					log.Printf("failed to set outgoing deadline: %s", err)
-				}
-			})
-			go func() {
-				defer wg.Done()
-				defer cancel2()
+			if stealthCfg.Enabled {
+				// Peek first packet для определения stealth/legacy
 				buf := make([]byte, 1600)
-				for {
-					select {
-					case <-ctx2.Done():
-						return
-					default:
-					}
-					if err1 := conn.SetReadDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
-						log.Printf("Failed: %s", err1)
-						return
-					}
-					n, err1 := conn.Read(buf)
-					if err1 != nil {
-						log.Printf("Failed: %s", err1)
-						return
-					}
-
-					if err1 := serverConn.SetWriteDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
-						log.Printf("Failed: %s", err1)
-						return
-					}
-					_, err1 = serverConn.Write(buf[:n])
-					if err1 != nil {
-						log.Printf("Failed: %s", err1)
-						return
-					}
+				n, err := conn.Read(buf)
+				if err != nil {
+					log.Printf("Failed to read first packet: %s", err)
+					return
 				}
-			}()
-			go func() {
-				defer wg.Done()
-				defer cancel2()
-				buf := make([]byte, 1600)
-				for {
-					select {
-					case <-ctx2.Done():
-						return
-					default:
-					}
-					if err1 := serverConn.SetReadDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
-						log.Printf("Failed: %s", err1)
-						return
-					}
-					n, err1 := serverConn.Read(buf)
-					if err1 != nil {
-						log.Printf("Failed: %s", err1)
-						return
-					}
+				firstPacket := make([]byte, n)
+				copy(firstPacket, buf[:n])
 
-					if err1 := conn.SetWriteDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
-						log.Printf("Failed: %s", err1)
-						return
-					}
-					_, err1 = conn.Write(buf[:n])
-					if err1 != nil {
-						log.Printf("Failed: %s", err1)
-						return
-					}
+				pipe := stealth.NewPipeline(stealthCfg)
+				if err := pipe.RunWithFirstPacket(ctx, conn, serverConn, firstPacket); err != nil {
+					log.Printf("Stealth pipeline error: %s", err)
 				}
-			}()
-			wg.Wait()
+			} else {
+				// Legacy relay (текущий код)
+				var wg sync.WaitGroup
+				wg.Add(2)
+				ctx2, cancel2 := context.WithCancel(ctx)
+				context.AfterFunc(ctx2, func() {
+					if err := conn.SetDeadline(time.Now()); err != nil {
+						log.Printf("failed to set incoming deadline: %s", err)
+					}
+					if err := serverConn.SetDeadline(time.Now()); err != nil {
+						log.Printf("failed to set outgoing deadline: %s", err)
+					}
+				})
+				go func() {
+					defer wg.Done()
+					defer cancel2()
+					buf := make([]byte, 1600)
+					for {
+						select {
+						case <-ctx2.Done():
+							return
+						default:
+						}
+						if err1 := conn.SetReadDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
+							log.Printf("Failed: %s", err1)
+							return
+						}
+						n, err1 := conn.Read(buf)
+						if err1 != nil {
+							log.Printf("Failed: %s", err1)
+							return
+						}
+						if err1 := serverConn.SetWriteDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
+							log.Printf("Failed: %s", err1)
+							return
+						}
+						_, err1 = serverConn.Write(buf[:n])
+						if err1 != nil {
+							log.Printf("Failed: %s", err1)
+							return
+						}
+					}
+				}()
+				go func() {
+					defer wg.Done()
+					defer cancel2()
+					buf := make([]byte, 1600)
+					for {
+						select {
+						case <-ctx2.Done():
+							return
+						default:
+						}
+						if err1 := serverConn.SetReadDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
+							log.Printf("Failed: %s", err1)
+							return
+						}
+						n, err1 := serverConn.Read(buf)
+						if err1 != nil {
+							log.Printf("Failed: %s", err1)
+							return
+						}
+						if err1 := conn.SetWriteDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
+							log.Printf("Failed: %s", err1)
+							return
+						}
+						_, err1 = conn.Write(buf[:n])
+						if err1 != nil {
+							log.Printf("Failed: %s", err1)
+							return
+						}
+					}
+				}()
+				wg.Wait()
+			}
 			log.Printf("Connection closed: %s\n", conn.RemoteAddr())
 		}(conn)
 	}
