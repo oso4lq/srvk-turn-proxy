@@ -1,3 +1,5 @@
+// stealth/framer.go
+
 package stealth
 
 import (

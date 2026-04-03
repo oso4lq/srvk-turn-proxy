@@ -1,3 +1,5 @@
+// stealth/adaptive_test.go
+
 package stealth
 
 import "testing"

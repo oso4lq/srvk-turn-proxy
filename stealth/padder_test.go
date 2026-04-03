@@ -1,3 +1,5 @@
+// stealth/padder_test.go
+
 package stealth
 
 import (

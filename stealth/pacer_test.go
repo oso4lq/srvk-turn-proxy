@@ -1,3 +1,5 @@
+// stealth/pacer_test.go
+
 package stealth
 
 import (

@@ -1,3 +1,5 @@
+// stealth/pipeline_test.go
+
 package stealth
 
 import (

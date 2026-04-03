@@ -1,3 +1,5 @@
+// stealth/adaptive.go
+
 package stealth
 
 // PacerMetrics — snapshot утилизации буфера Pacer.
