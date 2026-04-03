@@ -81,59 +81,148 @@ func getVkCreds(link string, dialer *dnsdialer.Dialer) (string, string, string, 
 		return resp, nil
 	}
 
-	var resp map[string]interface{}
-	defer func() {
-		if r := recover(); r != nil {
-			log.Panicf("get TURN creds error: %v\n\n", resp)
+	// Хелпер для безопасного извлечения вложенных полей из JSON
+	getString := func(m map[string]interface{}, keys ...string) (string, error) {
+		var current interface{} = m
+		for _, key := range keys {
+			cm, ok := current.(map[string]interface{})
+			if !ok {
+				return "", fmt.Errorf("expected object at key %q, got: %T", key, current)
+			}
+			current, ok = cm[key]
+			if !ok {
+				return "", fmt.Errorf("key %q not found in response: %v", key, cm)
+			}
 		}
-	}()
+		s, ok := current.(string)
+		if !ok {
+			return "", fmt.Errorf("expected string, got %T: %v", current, current)
+		}
+		return s, nil
+	}
 
+	// Шаг 1: Anonymous token
 	data := "client_id=6287487&token_type=messages&client_secret=QbYic1K3lEV5kTGiqlq2&version=1&app_id=6287487"
 	url := "https://login.vk.ru/?act=get_anonym_token"
 
 	resp, err := doRequest(data, url)
 	if err != nil {
-		return "", "", "", fmt.Errorf("request error:%s", err)
+		return "", "", "", fmt.Errorf("step 1 request: %s", err)
+	}
+	token1, err := getString(resp, "data", "access_token")
+	if err != nil {
+		return "", "", "", fmt.Errorf("step 1 (anonym token): %s", err)
 	}
 
-	token1 := resp["data"].(map[string]interface{})["access_token"].(string)
-
+	// Шаг 2: Call token (может вернуть капчу — error_code 14)
 	data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=123&access_token=%s", link, token1)
 	url = "https://api.vk.ru/method/calls.getAnonymousToken?v=5.274&client_id=6287487"
 
 	resp, err = doRequest(data, url)
 	if err != nil {
-		return "", "", "", fmt.Errorf("request error:%s", err)
+		return "", "", "", fmt.Errorf("step 2 request: %s", err)
+	}
+	token2, err := getString(resp, "response", "token")
+	if err != nil {
+		// Проверяем, не капча ли это
+		if errObj, ok := resp["error"].(map[string]interface{}); ok {
+			if code, _ := errObj["error_code"].(float64); code == 14 {
+				return "", "", "", fmt.Errorf("VK captcha required (sid=%v). Используй -creds-url для обработки капчи через бота", errObj["captcha_sid"])
+			}
+			return "", "", "", fmt.Errorf("step 2 VK error %v: %v", errObj["error_code"], errObj["error_msg"])
+		}
+		return "", "", "", fmt.Errorf("step 2 (call token): %s", err)
 	}
 
-	token2 := resp["response"].(map[string]interface{})["token"].(string)
-
+	// Шаг 3: Session key (OK.ru)
 	data = fmt.Sprintf("%s%s%s", "session_data=%7B%22version%22%3A2%2C%22device_id%22%3A%22", uuid.New(), "%22%2C%22client_version%22%3A1.1%2C%22client_type%22%3A%22SDK_JS%22%7D&method=auth.anonymLogin&format=JSON&application_key=CGMMEJLGDIHBABABA")
 	url = "https://calls.okcdn.ru/fb.do"
 
 	resp, err = doRequest(data, url)
 	if err != nil {
-		return "", "", "", fmt.Errorf("request error:%s", err)
+		return "", "", "", fmt.Errorf("step 3 request: %s", err)
+	}
+	token3, err := getString(resp, "session_key")
+	if err != nil {
+		return "", "", "", fmt.Errorf("step 3 (session key): %s", err)
 	}
 
-	token3 := resp["session_key"].(string)
-
+	// Шаг 4: TURN credentials
 	data = fmt.Sprintf("joinLink=%s&isVideo=false&protocolVersion=5&anonymToken=%s&method=vchat.joinConversationByLink&format=JSON&application_key=CGMMEJLGDIHBABABA&session_key=%s", link, token2, token3)
 	url = "https://calls.okcdn.ru/fb.do"
 
 	resp, err = doRequest(data, url)
 	if err != nil {
-		return "", "", "", fmt.Errorf("request error:%s", err)
+		return "", "", "", fmt.Errorf("step 4 request: %s", err)
+	}
+	user, err := getString(resp, "turn_server", "username")
+	if err != nil {
+		return "", "", "", fmt.Errorf("step 4 (turn username): %s", err)
+	}
+	pass, err := getString(resp, "turn_server", "credential")
+	if err != nil {
+		return "", "", "", fmt.Errorf("step 4 (turn credential): %s", err)
 	}
 
-	user := resp["turn_server"].(map[string]interface{})["username"].(string)
-	pass := resp["turn_server"].(map[string]interface{})["credential"].(string)
-	turn := resp["turn_server"].(map[string]interface{})["urls"].([]interface{})[0].(string)
+	// Извлекаем URL TURN-сервера из массива
+	turnServerObj, ok := resp["turn_server"].(map[string]interface{})
+	if !ok {
+		return "", "", "", fmt.Errorf("step 4: turn_server not an object")
+	}
+	urls, ok := turnServerObj["urls"].([]interface{})
+	if !ok || len(urls) == 0 {
+		return "", "", "", fmt.Errorf("step 4: turn_server.urls empty or missing")
+	}
+	turnURL, ok := urls[0].(string)
+	if !ok {
+		return "", "", "", fmt.Errorf("step 4: turn_server.urls[0] not a string")
+	}
 
-	clean := strings.Split(turn, "?")[0]
+	clean := strings.Split(turnURL, "?")[0]
 	address := strings.TrimPrefix(strings.TrimPrefix(clean, "turn:"), "turns:")
 
 	return user, pass, address, nil
+}
+
+// getHttpCreds получает credentials от внешнего HTTP-сервера (бота).
+// Бот сам ходит в VK API и обрабатывает капчу через Telegram.
+func getHttpCreds(credsURL string, link string) (string, string, string, error) {
+	client := &http.Client{
+		Timeout: 3 * time.Minute, // Капча может ждать до 2 мин
+	}
+
+	resp, err := client.Get(fmt.Sprintf("%s?link=%s", credsURL, link))
+	if err != nil {
+		return "", "", "", fmt.Errorf("creds-url request error: %s", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", "", fmt.Errorf("creds-url read body: %s", err)
+	}
+
+	if resp.StatusCode != 200 {
+		return "", "", "", fmt.Errorf("creds-url HTTP %d: %s", resp.StatusCode, body)
+	}
+
+	var creds struct {
+		Username   string `json:"username"`
+		Password   string `json:"password"`
+		TurnServer string `json:"turnServer"`
+		Error      string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &creds); err != nil {
+		return "", "", "", fmt.Errorf("creds-url parse JSON: %s", err)
+	}
+	if creds.Error != "" {
+		return "", "", "", fmt.Errorf("creds-url: %s", creds.Error)
+	}
+	if creds.Username == "" || creds.Password == "" || creds.TurnServer == "" {
+		return "", "", "", fmt.Errorf("creds-url: incomplete response: %s", body)
+	}
+
+	return creds.Username, creds.Password, creds.TurnServer, nil
 }
 
 func getYandexCreds(link string) (string, string, string, error) {
@@ -1102,6 +1191,7 @@ func main() { //nolint:cyclop
 	stealthPacing := flag.String("stealth-pacing", "", "режим pacing: audio, video, mixed (default video)")
 	stealthBuf := flag.Int("stealth-buf", 0, "размер буфера stealth (default 64)")
 	stealthMin := flag.Int("stealth-min", 2, "минимум каналов в stealth mode")
+	credsURL := flag.String("creds-url", "", "HTTP endpoint для credentials (http://127.0.0.1:3100/creds)")
 	flag.Parse()
 
 	stealthCfg := stealth.ResolveConfig(stealthFlag, stealthPacing, stealthBuf)
@@ -1122,14 +1212,23 @@ func main() { //nolint:cyclop
 		parts := strings.Split(*vklink, "join/")
 		link = parts[len(parts)-1]
 
-		dialer := dnsdialer.New(
-			dnsdialer.WithResolvers("77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53"),
-			dnsdialer.WithStrategy(dnsdialer.Fallback{}),
-			dnsdialer.WithCache(100, 10*time.Hour, 10*time.Hour),
-		)
-
-		getCreds = func(s string) (string, string, string, error) {
-			return getVkCreds(s, dialer)
+		if *credsURL != "" {
+			// Credentials через бота (с обработкой капчи)
+			url := *credsURL
+			getCreds = func(s string) (string, string, string, error) {
+				return getHttpCreds(url, s)
+			}
+			log.Printf("Credentials: через бота (%s)", url)
+		} else {
+			// Прямой запрос к VK API
+			dialer := dnsdialer.New(
+				dnsdialer.WithResolvers("77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53"),
+				dnsdialer.WithStrategy(dnsdialer.Fallback{}),
+				dnsdialer.WithCache(100, 10*time.Hour, 10*time.Hour),
+			)
+			getCreds = func(s string) (string, string, string, error) {
+				return getVkCreds(s, dialer)
+			}
 		}
 		if *n <= 0 {
 			*n = 16
